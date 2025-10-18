@@ -21,6 +21,7 @@
 #include "fb_gfx.h"
 #include "fd_forward.h"
 #include "fr_forward.h"
+#include <HTTPClient.h>
 
 #define ENROLL_CONFIRM_TIMES 5
 #define FACE_ID_SAVE_NUMBER 7
@@ -163,49 +164,85 @@ static void draw_face_boxes(dl_matrix3du_t *image_matrix, box_array_t *boxes, in
     }
 }
 
-static int run_face_recognition(dl_matrix3du_t *image_matrix, box_array_t *net_boxes){
-    dl_matrix3du_t *aligned_face = NULL;
-    int matched_id = 0;
+static int run_face_recognition(dl_matrix3du_t *image_matrix, box_array_t *net_boxes) {
+  dl_matrix3du_t *aligned_face = NULL;
+  int matched_id = -1; // -1 significa "não reconhecido" por padrão
 
-    aligned_face = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
-    if(!aligned_face){
-        Serial.println("Could not allocate face recognition buffer");
-        return matched_id;
-    }
-    if (align_face(net_boxes, image_matrix, aligned_face) == ESP_OK){
-        if (is_enrolling == 1){
-            int8_t left_sample_face = enroll_face(&id_list, aligned_face);
+  aligned_face = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
+  if (!aligned_face) {
+    Serial.println("Could not allocate face recognition buffer");
+    return -1;
+  }
 
-            if(left_sample_face == (ENROLL_CONFIRM_TIMES - 1)){
-                Serial.printf("Enrolling Face ID: %d\n", id_list.tail);
-            }
-            Serial.printf("Enrolling Face ID: %d sample %d\n", id_list.tail, ENROLL_CONFIRM_TIMES - left_sample_face);
-            rgb_printf(image_matrix, FACE_COLOR_CYAN, "ID[%u] Sample[%u]", id_list.tail, ENROLL_CONFIRM_TIMES - left_sample_face);
-            if (left_sample_face == 0){
-                is_enrolling = 0;
-                Serial.printf("Enrolled Face ID: %d\n", id_list.tail);
-            }
+  // Tenta alinhar o rosto encontrado na imagem
+  if (align_face(net_boxes, image_matrix, aligned_face) == ESP_OK) {
+    
+    // Converte a assinatura do rosto para um formato que podemos enviar (array de bytes)
+    uint8_t *face_template_data = aligned_face->item;
+    size_t face_template_size = aligned_face->w * aligned_face->h * aligned_face->c;
+
+    if (is_enrolling == 1) {
+      // --- LÓGICA PARA REGISTAR UM NOVO ROSTO ---
+      Serial.println("A registar um novo rosto no servidor...");
+      
+      HTTPClient http;
+      
+      // Criamos um nome de utilizador único com base no número de rostos já guardados
+      char url_buffer[200];
+      sprintf(url_buffer, "http://10.78.167.211:5000/registar_rosto?nome=user%d", id_list.count);
+
+      
+      http.begin(url_buffer);
+      http.addHeader("Content-Type", "application/octet-stream");
+
+      int httpCode = http.POST(face_template_data, face_template_size);
+
+      if (httpCode == HTTP_CODE_OK) {
+        Serial.printf("Rosto de user%d registado com sucesso no servidor!\n", id_list.count);
+        // Adicionamos um ID "falso" à lista local apenas para sabermos quantos rostos registámos
+        enroll_face(&id_list, aligned_face); 
+      } else {
+        Serial.printf("Erro ao registar rosto. Código de erro HTTP: %d\n", httpCode);
+      }
+      http.end();
+      is_enrolling = 0; // Desativa o modo de registo após uma tentativa
+
+    } else if (recognition_enabled) {
+      // --- LÓGICA PARA RECONHECER UM ROSTO ---
+      Serial.println("A verificar rosto no servidor...");
+      
+      HTTPClient http;
+      http.begin("http://10.78.167.211:5000/reconhecer_rosto");
+      http.addHeader("Content-Type", "application/octet-stream");
+
+      int httpCode = http.POST(face_template_data, face_template_size);
+
+      if (httpCode == HTTP_CODE_OK) {
+        String resposta_servidor = http.getString();
+        Serial.printf("Resposta do servidor: %s\n", resposta_servidor.c_str());
+        
+        if (resposta_servidor != "Rosto Desconhecido") {
+          autorizacao_acesso = true;  // SUCESSO! Ativa o LED verde
+          matched_id = 1; // Sinaliza sucesso (para o quadrado verde)
         } else {
-            matched_id = recognize_face(&id_list, aligned_face);
-            if (matched_id >= 0) {
-                Serial.printf("Match Face ID: %u\n", matched_id);
-                rgb_printf(image_matrix, FACE_COLOR_GREEN, "Bem vindo! %u", matched_id);
-                autorizacao_acesso = true;
-            } else {
-                Serial.println("No Match Found");
-                rgb_print(image_matrix, FACE_COLOR_RED, "Rosto desconhecido!");
-                matched_id = -1;
-                autorizacao_acesso = false;
-            }
+          autorizacao_acesso = false; // FALHA! Mantém o LED vermelho
         }
-    } else {
-        Serial.println("Face Not Aligned");
-        //rgb_print(image_matrix, FACE_COLOR_YELLOW, "Human Detected");
+      } else {
+        Serial.printf("Erro ao verificar rosto. Código de erro HTTP: %d\n", httpCode);
+        autorizacao_acesso = false;
+      }
+      http.end();
     }
+  } else {
+    Serial.println("Face Not Aligned");
+    autorizacao_acesso = false;
+  }
 
-    dl_matrix3du_free(aligned_face);
-    return matched_id;
+  dl_matrix3du_free(aligned_face);
+  return matched_id;
 }
+
+
 
 static size_t jpg_encode_stream(void * arg, size_t index, const void* data, size_t len){
     jpg_chunking_t *j = (jpg_chunking_t *)arg;

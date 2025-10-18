@@ -1,5 +1,7 @@
 #include "esp_camera.h"
 #include <WiFi.h>
+#include <HTTPClient.h>
+
 boolean autorizacao_acesso = false;
 
 //
@@ -131,5 +133,5 @@ void loop() {
     digitalWrite(LED_VERDE, LOW);
   }
   
-  delay(10000);
+  delay(100); // Verifica o estado 10 vezes por segundo
 }
