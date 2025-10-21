@@ -189,10 +189,8 @@ static int run_face_recognition(dl_matrix3du_t *image_matrix, box_array_t *net_b
       
       // Criamos um nome de utilizador único com base no número de rostos já guardados
       char url_buffer[200];
-      sprintf(url_buffer, "http://10.78.167.211:5000/registar_rosto?nome=user%d", id_list.count);
+      http.begin("http://10.42.227.211:5000/registar_rosto");
 
-      
-      http.begin(url_buffer);
       http.addHeader("Content-Type", "application/octet-stream");
 
       int httpCode = http.POST(face_template_data, face_template_size);
@@ -212,7 +210,7 @@ static int run_face_recognition(dl_matrix3du_t *image_matrix, box_array_t *net_b
       Serial.println("A verificar rosto no servidor...");
       
       HTTPClient http;
-      http.begin("http://10.78.167.211:5000/reconhecer_rosto");
+      http.begin("http://10.42.227.211:5000/reconhecer_rosto");
       http.addHeader("Content-Type", "application/octet-stream");
 
       int httpCode = http.POST(face_template_data, face_template_size);
