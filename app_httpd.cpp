@@ -189,7 +189,7 @@ static int run_face_recognition(dl_matrix3du_t *image_matrix, box_array_t *net_b
       
       // Criamos um nome de utilizador único com base no número de rostos já guardados
       char url_buffer[200];
-      http.begin("http://10.42.227.211:5000/registar_rosto");
+      http.begin("http://10.23.119.211:5000/registar_rosto");
 
       http.addHeader("Content-Type", "application/octet-stream");
 
@@ -210,7 +210,7 @@ static int run_face_recognition(dl_matrix3du_t *image_matrix, box_array_t *net_b
       Serial.println("A verificar rosto no servidor...");
       
       HTTPClient http;
-      http.begin("http://10.42.227.211:5000/reconhecer_rosto");
+      http.begin("http://10.23.119.211:5000/reconhecer_rosto");
       http.addHeader("Content-Type", "application/octet-stream");
 
       int httpCode = http.POST(face_template_data, face_template_size);
@@ -222,12 +222,15 @@ static int run_face_recognition(dl_matrix3du_t *image_matrix, box_array_t *net_b
         if (resposta_servidor != "Rosto Desconhecido") {
           autorizacao_acesso = true;  // SUCESSO! Ativa o LED verde
           matched_id = 1; // Sinaliza sucesso (para o quadrado verde)
+          rgb_printf(image_matrix, FACE_COLOR_GREEN, "%s", resposta_servidor.c_str());
         } else {
           autorizacao_acesso = false; // FALHA! Mantém o LED vermelho
+          rgb_print(image_matrix, FACE_COLOR_RED, "Desconhecido");
         }
       } else {
         Serial.printf("Erro ao verificar rosto. Código de erro HTTP: %d\n", httpCode);
         autorizacao_acesso = false;
+        rgb_print(image_matrix, FACE_COLOR_RED, "Erro Servidor");
       }
       http.end();
     }
