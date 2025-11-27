@@ -11,21 +11,26 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#include "esp_http_server.h"
-#include "esp_timer.h"
-#include "esp_camera.h"
-#include "img_converters.h"
-#include "camera_index.h"
-#include "Arduino.h"
 
-#include "fb_gfx.h"
-#include "fd_forward.h"
-#include "fr_forward.h"
-#include <HTTPClient.h>
+// Inclusão das bibliotecas necessárias para o funcionamento do servidor web e da câmera
+#include "esp_http_server.h" // Biblioteca para criar o servidor HTTP no ESP32
+#include "esp_timer.h"       // Biblioteca para temporização e contagem de tempo
+#include "esp_camera.h"      // Biblioteca principal para controle da câmera OV2640/OV3660
+#include "img_converters.h"  // Biblioteca para conversão de formatos de imagem (ex: RGB para JPEG)
+#include "camera_index.h"    // Arquivo de cabeçalho contendo o HTML da página web (geralmente comprimido em gzip)
+#include "Arduino.h"         // Biblioteca base do Arduino para ESP32
 
-#define ENROLL_CONFIRM_TIMES 5
-#define FACE_ID_SAVE_NUMBER 7
+// Inclusão de bibliotecas para processamento de imagem e reconhecimento facial
+#include "fb_gfx.h"          // Biblioteca gráfica para desenhar no framebuffer (caixas, texto)
+#include "fd_forward.h"      // Biblioteca de detecção facial (Face Detection)
+#include "fr_forward.h"      // Biblioteca de reconhecimento facial (Face Recognition)
+#include <HTTPClient.h>      // Biblioteca para fazer requisições HTTP (POST, GET) para outros servidores
 
+// Definições de constantes para o reconhecimento facial
+#define ENROLL_CONFIRM_TIMES 5 // Número de vezes que o rosto deve ser detectado para confirmar o cadastro
+#define FACE_ID_SAVE_NUMBER 7  // Número máximo de IDs de rosto que podem ser salvos
+
+// Definições de cores para desenho na imagem (formato ARGB ou similar)
 #define FACE_COLOR_WHITE  0x00FFFFFF
 #define FACE_COLOR_BLACK  0x00000000
 #define FACE_COLOR_RED    0x000000FF
@@ -35,64 +40,82 @@
 #define FACE_COLOR_CYAN   (FACE_COLOR_BLUE | FACE_COLOR_GREEN)
 #define FACE_COLOR_PURPLE (FACE_COLOR_BLUE | FACE_COLOR_RED)
 
+// Estrutura para o filtro de média móvel (usado para suavizar a taxa de quadros - FPS)
 typedef struct {
-        size_t size; //number of values used for filtering
-        size_t index; //current value index
-        size_t count; //value count
-        int sum;
-        int * values; //array to be filled with values
+        size_t size; // Tamanho da amostra para o filtro (número de valores armazenados)
+        size_t index; // Índice atual no array de valores
+        size_t count; // Contagem atual de valores inseridos
+        int sum;      // Soma atual dos valores (para cálculo rápido da média)
+        int * values; // Ponteiro para o array que armazena os valores
 } ra_filter_t;
 
+// Estrutura para gerenciar o envio de imagens JPEG em pedaços (chunks)
 typedef struct {
-        httpd_req_t *req;
-        size_t len;
+        httpd_req_t *req; // Ponteiro para a requisição HTTP atual
+        size_t len;       // Tamanho total dos dados enviados
 } jpg_chunking_t;
 
-#define PART_BOUNDARY "123456789000000000000987654321"
-static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
-static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
-static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+// Definições para o stream de vídeo MJPEG (Multipart JPEG)
+#define PART_BOUNDARY "123456789000000000000987654321" // Delimitador único para separar os frames no stream
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY; // Cabeçalho Content-Type para stream MJPEG
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n"; // String delimitadora entre frames
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n"; // Cabeçalho de cada parte (frame JPEG)
 
-static ra_filter_t ra_filter;
-httpd_handle_t stream_httpd = NULL;
-httpd_handle_t camera_httpd = NULL;
+// Variáveis globais
+static ra_filter_t ra_filter; // Instância do filtro de média móvel
+httpd_handle_t stream_httpd = NULL; // Handle para o servidor HTTP do stream de vídeo
+httpd_handle_t camera_httpd = NULL; // Handle para o servidor HTTP de controle e captura
 
-static mtmn_config_t mtmn_config = {0};
-static int8_t detection_enabled = 0;
-static int8_t recognition_enabled = 0;
-static int8_t is_enrolling = 0;
-static face_id_list id_list = {0};
+// Configurações e variáveis de estado para detecção/reconhecimento facial
+static mtmn_config_t mtmn_config = {0}; // Configuração da rede neural de detecção facial (MTMN)
+static int8_t detection_enabled = 0;    // Flag para habilitar/desabilitar detecção facial
+static int8_t recognition_enabled = 0;  // Flag para habilitar/desabilitar reconhecimento facial
+static int8_t is_enrolling = 0;         // Flag para indicar se está no modo de cadastro de rosto
+static face_id_list id_list = {0};      // Lista de IDs de rostos cadastrados localmente (na memória RAM do ESP32)
 
+// Variável externa (definida no arquivo .ino) para controlar o acesso (LEDs)
 extern boolean autorizacao_acesso;
 
+// Função para inicializar o filtro de média móvel
 static ra_filter_t * ra_filter_init(ra_filter_t * filter, size_t sample_size){
+    // Limpa a estrutura do filtro
     memset(filter, 0, sizeof(ra_filter_t));
 
+    // Aloca memória para o array de valores
     filter->values = (int *)malloc(sample_size * sizeof(int));
     if(!filter->values){
-        return NULL;
+        return NULL; // Retorna NULL se falhar a alocação
     }
+    // Inicializa o array com zeros
     memset(filter->values, 0, sample_size * sizeof(int));
 
-    filter->size = sample_size;
+    filter->size = sample_size; // Define o tamanho do filtro
     return filter;
 }
 
+// Função para adicionar um valor ao filtro e obter a média atual
 static int ra_filter_run(ra_filter_t * filter, int value){
     if(!filter->values){
-        return value;
+        return value; // Se não houver buffer, retorna o valor bruto
     }
+    // Subtrai o valor antigo que será sobrescrito da soma
     filter->sum -= filter->values[filter->index];
+    // Armazena o novo valor na posição atual
     filter->values[filter->index] = value;
+    // Adiciona o novo valor à soma
     filter->sum += filter->values[filter->index];
+    // Avança o índice circularmente
     filter->index++;
     filter->index = filter->index % filter->size;
+    // Incrementa a contagem até atingir o tamanho total
     if (filter->count < filter->size) {
         filter->count++;
     }
+    // Retorna a média (soma / contagem)
     return filter->sum / filter->count;
 }
 
+// Função auxiliar para desenhar texto na imagem (usada para debug/status)
 static void rgb_print(dl_matrix3du_t *image_matrix, uint32_t color, const char * str){
     fb_data_t fb;
     fb.width = image_matrix->w;
@@ -100,9 +123,11 @@ static void rgb_print(dl_matrix3du_t *image_matrix, uint32_t color, const char *
     fb.data = image_matrix->item;
     fb.bytes_per_pixel = 3;
     fb.format = FB_BGR888;
+    // Desenha o texto centralizado na parte superior
     fb_gfx_print(&fb, (fb.width - (strlen(str) * 14)) / 2, 10, color, str);
 }
 
+// Função auxiliar tipo printf para desenhar texto formatado na imagem
 static int rgb_printf(dl_matrix3du_t *image_matrix, uint32_t color, const char *format, ...){
     char loc_buf[64];
     char * temp = loc_buf;
@@ -111,8 +136,10 @@ static int rgb_printf(dl_matrix3du_t *image_matrix, uint32_t color, const char *
     va_list copy;
     va_start(arg, format);
     va_copy(copy, arg);
+    // Formata a string
     len = vsnprintf(loc_buf, sizeof(loc_buf), format, arg);
     va_end(copy);
+    // Se o buffer local for pequeno, aloca um maior
     if(len >= sizeof(loc_buf)){
         temp = (char*)malloc(len+1);
         if(temp == NULL) {
@@ -121,20 +148,22 @@ static int rgb_printf(dl_matrix3du_t *image_matrix, uint32_t color, const char *
     }
     vsnprintf(temp, len+1, format, arg);
     va_end(arg);
+    // Desenha a string formatada
     rgb_print(image_matrix, color, temp);
     if(len > 64){
-        free(temp);
+        free(temp); // Libera memória se foi alocada dinamicamente
     }
     return len;
 }
 
+// Função para desenhar as caixas ao redor dos rostos detectados
 static void draw_face_boxes(dl_matrix3du_t *image_matrix, box_array_t *boxes, int face_id){
     int x, y, w, h, i;
-    uint32_t color = FACE_COLOR_YELLOW;
+    uint32_t color = FACE_COLOR_YELLOW; // Cor padrão: Amarelo (detectado, mas não reconhecido/verificado)
     if(face_id < 0){
-        color = FACE_COLOR_RED;
+        color = FACE_COLOR_RED; // Vermelho: Rosto desconhecido ou erro
     } else if(face_id > 0){
-        color = FACE_COLOR_GREEN;
+        color = FACE_COLOR_GREEN; // Verde: Rosto reconhecido/autorizado
     }
     fb_data_t fb;
     fb.width = image_matrix->w;
@@ -142,17 +171,20 @@ static void draw_face_boxes(dl_matrix3du_t *image_matrix, box_array_t *boxes, in
     fb.data = image_matrix->item;
     fb.bytes_per_pixel = 3;
     fb.format = FB_BGR888;
+    // Itera sobre todas as caixas de rostos detectados
     for (i = 0; i < boxes->len; i++){
         // rectangle box
         x = (int)boxes->box[i].box_p[0];
         y = (int)boxes->box[i].box_p[1];
         w = (int)boxes->box[i].box_p[2] - x + 1;
         h = (int)boxes->box[i].box_p[3] - y + 1;
+        // Desenha as linhas da caixa
         fb_gfx_drawFastHLine(&fb, x, y, w, color);
         fb_gfx_drawFastHLine(&fb, x, y+h-1, w, color);
         fb_gfx_drawFastVLine(&fb, x, y, h, color);
         fb_gfx_drawFastVLine(&fb, x+w-1, y, h, color);
 #if 0
+        // Código comentado para desenhar landmarks (pontos chave do rosto: olhos, nariz, boca)
         // landmark
         int x0, y0, j;
         for (j = 0; j < 10; j+=2) {
@@ -164,71 +196,74 @@ static void draw_face_boxes(dl_matrix3du_t *image_matrix, box_array_t *boxes, in
     }
 }
 
+// Função principal para gerenciar o reconhecimento facial e comunicação com o servidor externo
 static int run_face_recognition(dl_matrix3du_t *image_matrix, box_array_t *net_boxes) {
   dl_matrix3du_t *aligned_face = NULL;
-  int matched_id = -1; // -1 significa "não reconhecido" por padrão
+  int matched_id = -1; 
 
+  // Aloca memória para o rosto alinhado (56x56 pixels)
   aligned_face = dl_matrix3du_alloc(1, FACE_WIDTH, FACE_HEIGHT, 3);
   if (!aligned_face) {
     Serial.println("Could not allocate face recognition buffer");
     return -1;
   }
 
-  // Tenta alinhar o rosto encontrado na imagem
+  // 1. ALINHAMENTO (Pré-processamento da IA)
   if (align_face(net_boxes, image_matrix, aligned_face) == ESP_OK) {
     
-    // Converte a assinatura do rosto para um formato que podemos enviar (array de bytes)
+    // Prepara os dados do embedding para envio (bytes brutos da imagem alinhada)
     uint8_t *face_template_data = aligned_face->item;
     size_t face_template_size = aligned_face->w * aligned_face->h * aligned_face->c;
 
+    // 2. LÓGICA DE CADASTRO (Se o botão "Enroll" foi clicado)
     if (is_enrolling == 1) {
-      // --- LÓGICA PARA REGISTAR UM NOVO ROSTO ---
       Serial.println("A registar um novo rosto no servidor...");
       
       HTTPClient http;
-      
-      // Criamos um nome de utilizador único com base no número de rostos já guardados
-      char url_buffer[200];
-      http.begin("http://10.23.119.211:5000/registar_rosto");
+      // Conecta ao endpoint de registro do servidor Python
+      // NOTA: O IP deve ser atualizado conforme a rede
+      http.begin("http://10.214.22.211:5000/registar_rosto"); 
 
       http.addHeader("Content-Type", "application/octet-stream");
 
+      // Envia os dados via POST
       int httpCode = http.POST(face_template_data, face_template_size);
 
       if (httpCode == HTTP_CODE_OK) {
-        Serial.printf("Rosto de user%d registado com sucesso no servidor!\n", id_list.count);
-        // Adicionamos um ID "falso" à lista local apenas para sabermos quantos rostos registámos
-        enroll_face(&id_list, aligned_face); 
+        Serial.printf("Rosto registado com sucesso!\n");
+        enroll_face(&id_list, aligned_face); // Mantém contagem local (visual)
       } else {
-        Serial.printf("Erro ao registar rosto. Código de erro HTTP: %d\n", httpCode);
+        Serial.printf("Erro ao registar rosto. Código: %d\n", httpCode);
       }
       http.end();
-      is_enrolling = 0; // Desativa o modo de registo após uma tentativa
+      is_enrolling = 0; // Desativa modo de cadastro
 
+    // 3. LÓGICA DE RECONHECIMENTO (Se "Face Recognition" estiver ativo)
     } else if (recognition_enabled) {
-      // --- LÓGICA PARA RECONHECER UM ROSTO ---
       Serial.println("A verificar rosto no servidor...");
       
       HTTPClient http;
-      http.begin("http://10.23.119.211:5000/reconhecer_rosto");
+      // Conecta ao endpoint de reconhecimento
+      http.begin("http://10.214.22.211:5000/reconhecer_rosto"); 
       http.addHeader("Content-Type", "application/octet-stream");
 
+      // Envia os dados para comparação
       int httpCode = http.POST(face_template_data, face_template_size);
 
       if (httpCode == HTTP_CODE_OK) {
-        String resposta_servidor = http.getString();
+        String resposta_servidor = http.getString(); // Recebe o nome ou "Desconhecido"
         Serial.printf("Resposta do servidor: %s\n", resposta_servidor.c_str());
         
         if (resposta_servidor != "Rosto Desconhecido") {
-          autorizacao_acesso = true;  // SUCESSO! Ativa o LED verde
-          matched_id = 1; // Sinaliza sucesso (para o quadrado verde)
-          rgb_printf(image_matrix, FACE_COLOR_GREEN, "%s", resposta_servidor.c_str());
+          autorizacao_acesso = true;  // SUCESSO! Ativa LED Verde
+          matched_id = 1; // Quadrado Verde
+          rgb_printf(image_matrix, FACE_COLOR_GREEN, "%s", resposta_servidor.c_str()); // Escreve o nome
         } else {
-          autorizacao_acesso = false; // FALHA! Mantém o LED vermelho
+          autorizacao_acesso = false; // FALHA! LED Vermelho
           rgb_print(image_matrix, FACE_COLOR_RED, "Desconhecido");
         }
       } else {
-        Serial.printf("Erro ao verificar rosto. Código de erro HTTP: %d\n", httpCode);
+        Serial.printf("Erro na verificação. Código: %d\n", httpCode);
         autorizacao_acesso = false;
         rgb_print(image_matrix, FACE_COLOR_RED, "Erro Servidor");
       }
@@ -244,20 +279,24 @@ static int run_face_recognition(dl_matrix3du_t *image_matrix, box_array_t *net_b
 }
 
 
-
+// Função de callback para enviar chunks de imagem JPEG via HTTP
 static size_t jpg_encode_stream(void * arg, size_t index, const void* data, size_t len){
     jpg_chunking_t *j = (jpg_chunking_t *)arg;
     if(!index){
-        j->len = 0;
+        j->len = 0; // Reinicia o contador no primeiro chunk
     }
+    // Envia o chunk atual para o cliente HTTP
     if(httpd_resp_send_chunk(j->req, (const char *)data, len) != ESP_OK){
-        return 0;
+        return 0; // Erro no envio
     }
-    j->len += len;
+    j->len += len; // Incrementa o total enviado
     return len;
 }
 
+// Handler para a rota /capture (tira uma foto estática)
 static esp_err_t capture_handler(httpd_req_t *req){
+    // ... (Código padrão de captura mantido) ...
+    // (Este handler é útil se você quiser tirar uma foto única)
     camera_fb_t * fb = NULL;
     esp_err_t res = ESP_OK;
     int64_t fr_start = esp_timer_get_time();
@@ -278,6 +317,7 @@ static esp_err_t capture_handler(httpd_req_t *req){
     bool s;
     bool detected = false;
     int face_id = 0;
+    
     if(!detection_enabled || fb->width > 400){
         size_t fb_len = 0;
         if(fb->format == PIXFORMAT_JPEG){
@@ -344,6 +384,7 @@ static esp_err_t capture_handler(httpd_req_t *req){
     return res;
 }
 
+// Handler para a rota /stream (stream de vídeo MJPEG)
 static esp_err_t stream_handler(httpd_req_t *req){
     camera_fb_t * fb = NULL;
     esp_err_t res = ESP_OK;
@@ -384,6 +425,7 @@ static esp_err_t stream_handler(httpd_req_t *req){
             fr_face = fr_start;
             fr_encode = fr_start;
             fr_recognize = fr_start;
+            
             if(!detection_enabled || fb->width > 400){
                 if(fb->format != PIXFORMAT_JPEG){
                     bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
@@ -398,7 +440,7 @@ static esp_err_t stream_handler(httpd_req_t *req){
                     _jpg_buf = fb->buf;
                 }
             } else {
-
+                // --- INÍCIO DO PROCESSAMENTO DE IA NO STREAM ---
                 image_matrix = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
 
                 if (!image_matrix) {
@@ -411,24 +453,30 @@ static esp_err_t stream_handler(httpd_req_t *req){
                     } else {
                         fr_ready = esp_timer_get_time();
                         box_array_t *net_boxes = NULL;
+                        
+                        // 1. Deteção Facial
                         if(detection_enabled){
                             net_boxes = face_detect(image_matrix, &mtmn_config);
                         }
                         fr_face = esp_timer_get_time();
                         fr_recognize = fr_face;
+                        
                         if (net_boxes || fb->format != PIXFORMAT_JPEG){
                             if(net_boxes){
                                 detected = true;
+                                // 2. Reconhecimento Facial (Chama a nossa função de rede)
                                 if(recognition_enabled){
                                     face_id = run_face_recognition(image_matrix, net_boxes);
                                 }
                                 fr_recognize = esp_timer_get_time();
+                                // 3. Desenha o resultado na imagem
                                 draw_face_boxes(image_matrix, net_boxes, face_id);
                                 free(net_boxes->score);
                                 free(net_boxes->box);
                                 free(net_boxes->landmark);
                                 free(net_boxes);
                             }
+                            // Converte de volta para JPEG para envio
                             if(!fmt2jpg(image_matrix->item, fb->width*fb->height*3, fb->width, fb->height, PIXFORMAT_RGB888, 90, &_jpg_buf, &_jpg_buf_len)){
                                 Serial.println("fmt2jpg failed");
                                 res = ESP_FAIL;
@@ -445,6 +493,7 @@ static esp_err_t stream_handler(httpd_req_t *req){
                 }
             }
         }
+        // Envio dos dados
         if(res == ESP_OK){
             size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
             res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
@@ -491,12 +540,14 @@ static esp_err_t stream_handler(httpd_req_t *req){
     return res;
 }
 
+// Handler para a rota /control (ajuste de configurações da câmera via query params)
 static esp_err_t cmd_handler(httpd_req_t *req){
     char*  buf;
     size_t buf_len;
     char variable[32] = {0,};
     char value[32] = {0,};
 
+    // Parseia a query string da URL (ex: /control?var=framesize&val=5)
     buf_len = httpd_req_get_url_query_len(req) + 1;
     if (buf_len > 1) {
         buf = (char*)malloc(buf_len);
@@ -523,10 +574,11 @@ static esp_err_t cmd_handler(httpd_req_t *req){
         return ESP_FAIL;
     }
 
-    int val = atoi(value);
-    sensor_t * s = esp_camera_sensor_get();
+    int val = atoi(value); // Converte o valor para inteiro
+    sensor_t * s = esp_camera_sensor_get(); // Obtém o ponteiro para o sensor da câmera
     int res = 0;
 
+    // Verifica qual variável está sendo alterada e chama a função correspondente do sensor
     if(!strcmp(variable, "framesize")) {
         if(s->pixformat == PIXFORMAT_JPEG) res = s->set_framesize(s, (framesize_t)val);
     }
@@ -556,18 +608,18 @@ static esp_err_t cmd_handler(httpd_req_t *req){
     else if(!strcmp(variable, "face_detect")) {
         detection_enabled = val;
         if(!detection_enabled) {
-            recognition_enabled = 0;
+            recognition_enabled = 0; // Desabilita reconhecimento se detecção for desabilitada
         }
     }
     else if(!strcmp(variable, "face_enroll")) is_enrolling = val;
     else if(!strcmp(variable, "face_recognize")) {
         recognition_enabled = val;
         if(recognition_enabled){
-            detection_enabled = val;
+            detection_enabled = val; // Habilita detecção se reconhecimento for habilitado
         }
     }
     else {
-        res = -1;
+        res = -1; // Variável desconhecida
     }
 
     if(res){
@@ -578,6 +630,7 @@ static esp_err_t cmd_handler(httpd_req_t *req){
     return httpd_resp_send(req, NULL, 0);
 }
 
+// Handler para a rota /status (retorna JSON com o estado atual da câmera)
 static esp_err_t status_handler(httpd_req_t *req){
     static char json_response[1024];
 
@@ -585,6 +638,7 @@ static esp_err_t status_handler(httpd_req_t *req){
     char * p = json_response;
     *p++ = '{';
 
+    // Constrói o JSON manualmente
     p+=sprintf(p, "\"framesize\":%u,", s->status.framesize);
     p+=sprintf(p, "\"quality\":%u,", s->status.quality);
     p+=sprintf(p, "\"brightness\":%d,", s->status.brightness);
@@ -620,19 +674,23 @@ static esp_err_t status_handler(httpd_req_t *req){
     return httpd_resp_send(req, json_response, strlen(json_response));
 }
 
+// Handler para a rota raiz / (serve a página HTML principal)
 static esp_err_t index_handler(httpd_req_t *req){
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(req, "Content-Encoding", "gzip"); // O HTML está comprimido
     sensor_t * s = esp_camera_sensor_get();
+    // Seleciona o HTML correto baseado no modelo do sensor (OV3660 ou OV2640)
     if (s->id.PID == OV3660_PID) {
         return httpd_resp_send(req, (const char *)index_ov3660_html_gz, index_ov3660_html_gz_len);
     }
     return httpd_resp_send(req, (const char *)index_ov2640_html_gz, index_ov2640_html_gz_len);
 }
 
+// Função para iniciar o servidor da câmera
 void startCameraServer(){
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG(); // Carrega configuração padrão
 
+    // Definição das rotas (URIs)
     httpd_uri_t index_uri = {
         .uri       = "/",
         .method    = HTTP_GET,
@@ -669,10 +727,12 @@ void startCameraServer(){
     };
 
 
+    // Inicializa o filtro de FPS
     ra_filter_init(&ra_filter, 20);
     
-    mtmn_config.type = FAST;
-    mtmn_config.min_face = 80;
+    // Configurações da rede neural de detecção facial (MTMN)
+    mtmn_config.type = FAST; // Modo rápido
+    mtmn_config.min_face = 80; // Tamanho mínimo do rosto
     mtmn_config.pyramid = 0.707;
     mtmn_config.pyramid_times = 4;
     mtmn_config.p_threshold.score = 0.6;
@@ -685,8 +745,10 @@ void startCameraServer(){
     mtmn_config.o_threshold.nms = 0.7;
     mtmn_config.o_threshold.candidate_number = 1;
     
+    // Inicializa a lista de IDs de rostos
     face_id_init(&id_list, FACE_ID_SAVE_NUMBER, ENROLL_CONFIRM_TIMES);
     
+    // Inicia o servidor web principal (porta 80 por padrão)
     Serial.printf("Starting web server on port: '%d'\n", config.server_port);
     if (httpd_start(&camera_httpd, &config) == ESP_OK) {
         httpd_register_uri_handler(camera_httpd, &index_uri);
@@ -695,6 +757,7 @@ void startCameraServer(){
         httpd_register_uri_handler(camera_httpd, &capture_uri);
     }
 
+    // Inicia o servidor de stream em uma porta diferente (porta + 1)
     config.server_port += 1;
     config.ctrl_port += 1;
     Serial.printf("Starting stream server on port: '%d'\n", config.server_port);
