@@ -96,6 +96,6 @@ O projeto consiste em um sistema de segurança que utiliza uma câmera ESP32-CAM
 
 ---
 
-**Autor**: Yan Zucchini
+**Autores**: Yan Zucchini e Maria Eduarda Wechter
 **Instituição**: IFSP
 **Ano**: 2025
